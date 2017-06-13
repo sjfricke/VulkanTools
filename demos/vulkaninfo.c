@@ -19,6 +19,7 @@
  * Author: David Pinedo <david@lunarg.com>
  * Author: Mark Lobodzinski <mark@lunarg.com>
  * Author: Rene Lindsay <rene@lunarg.com>
+ * Author: Jeremy Kniager <jeremyk@lunarg.com>
  */
 
 #ifdef __GNUC__
@@ -93,6 +94,11 @@ static int ConsoleIsExclusive(void) {
 #define MAX_QUEUE_TYPES 5
 #define APP_SHORT_NAME "vulkaninfo"
 
+struct VkStructureHeader {
+    VkStructureType sType;
+    void* pNext;
+};
+
 struct AppGpu;
 
 struct AppDev {
@@ -101,6 +107,7 @@ struct AppDev {
     VkDevice obj;
 
     VkFormatProperties format_props[VK_FORMAT_RANGE_SIZE];
+    VkFormatProperties2KHR format_props2[VK_FORMAT_RANGE_SIZE];
 };
 
 struct LayerExtensionList {
@@ -116,10 +123,22 @@ struct AppInstance {
     uint32_t global_extension_count;
     VkExtensionProperties *global_extensions;  // Instance Extensions
 
+    VkBool32 device_features2_enabled;
+    VkBool32 display_surface_counter_enabled;
+    VkBool32 external_semaphore_capabilities_enabled;
+    VkBool32 external_memory_capabilities_enabled;
+    VkBool32 khr_surface_enabled;
+    VkBool32 surface_capabilities2_enabled;
+
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR;
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR vkGetPhysicalDeviceSurfacePresentModesKHR;
+
+    VkSurfaceCapabilitiesKHR surface_capabilities;
+    VkSurfaceCapabilities2KHR surface_capabilities2;
+    VkSharedPresentSurfaceCapabilitiesKHR shared_surface_capabilities;
+    VkSurfaceCapabilities2EXT surface_capabilities2_ext;
 
     VkSurfaceKHR surface;
     int width, height;
@@ -144,17 +163,39 @@ struct AppGpu {
     VkPhysicalDevice obj;
 
     VkPhysicalDeviceProperties props;
+    VkPhysicalDeviceProperties2KHR props2;
+    VkPhysicalDeviceIDPropertiesKHX IDProps;
 
     uint32_t queue_count;
     VkQueueFamilyProperties *queue_props;
+    VkQueueFamilyProperties2KHR *queue_props2;
     VkDeviceQueueCreateInfo *queue_reqs;
 
+    VkBool32 device_features2_enabled;
+    VkBool32 external_semaphore_capabilities_enabled;
+    VkBool32 external_memory_capabilities_enabled;
+
+#define APPGPU_EXTERNAL_SEMAPHORE_PROPS_COUNT 5
+    VkExternalSemaphorePropertiesKHX semaphore_props[APPGPU_EXTERNAL_SEMAPHORE_PROPS_COUNT];
+
+#define BUFFER_CREATE_FLAG_COUNT 3
+#define BUFFER_USAGE_FLAG_COUNT 9
+#define EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT 7
+#define APPGPU_EXTERNAL_BUFFER_PROPS_COUNT (512 * 8 * EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT) // pow(2,BUFFER_USAGE_FLAG_COUNT) * pow(2,BUFFER_CREATE_FLAG_COUNT) * EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT
+    VkExternalBufferPropertiesKHX external_buffer_props[APPGPU_EXTERNAL_BUFFER_PROPS_COUNT];
+
     VkPhysicalDeviceMemoryProperties memory_props;
+    VkPhysicalDeviceMemoryProperties2KHR memory_props2;
+
     VkPhysicalDeviceFeatures features;
+    VkPhysicalDeviceFeatures2KHR features2;
+    VkPhysicalDeviceMultiviewFeaturesKHX multiViewFeatures;
     VkPhysicalDevice limits;
 
     uint32_t device_extension_count;
     VkExtensionProperties *device_extensions;
+
+    PFN_vkGetPhysicalDeviceFormatProperties2KHR vkGetPhysicalDeviceFormatProperties2KHR;
 
     struct AppDev dev;
 };
@@ -443,7 +484,13 @@ static void AppDevInitFormats(struct AppDev *dev) {
     for (f = 0; f < VK_FORMAT_RANGE_SIZE; f++) {
         const VkFormat fmt = f;
 
-        vkGetPhysicalDeviceFormatProperties(dev->gpu->obj, fmt, &dev->format_props[f]);
+        if (dev->gpu->device_features2_enabled) {
+            dev->format_props2[f].sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2_KHR;
+            dev->format_props2[f].pNext = NULL;
+            dev->gpu->vkGetPhysicalDeviceFormatProperties2KHR(dev->gpu->obj, fmt, &dev->format_props2[f]);
+        } else {
+            vkGetPhysicalDeviceFormatProperties(dev->gpu->obj, fmt, &dev->format_props[f]);
+        }
     }
 }
 
@@ -493,6 +540,21 @@ static void AppDevInit(struct AppDev *dev, struct AppGpu *gpu) {
     // Device extensions
     AppGetPhysicalDeviceLayerExtensions(gpu, NULL, &gpu->device_extension_count, &gpu->device_extensions);
 
+    #define extraDeviceExtensionCount 1
+    char* extraDeviceExtensions[extraDeviceExtensionCount] = { "VK_KHX_multiview" };
+    char* availableExtraDeviceExtensions[extraDeviceExtensionCount];
+    uint32_t availableEDECount = 0;
+
+    for (uint32_t i = 0; (gpu->device_features2_enabled && (i < extraDeviceExtensionCount)); i++) {
+        for (uint32_t j = 0; j < gpu->device_extension_count; j++) {
+            if (!strcmp(extraDeviceExtensions[i], gpu->device_extensions[j].extensionName)) {
+                availableExtraDeviceExtensions[availableEDECount] = extraDeviceExtensions[i];
+                availableEDECount++;
+                break;
+            }
+        }
+    }
+
     fflush(stdout);
 
     /* request all queues */
@@ -501,8 +563,8 @@ static void AppDevInit(struct AppDev *dev, struct AppGpu *gpu) {
 
     info.enabledLayerCount = 0;
     info.ppEnabledLayerNames = NULL;
-    info.enabledExtensionCount = 0;
-    info.ppEnabledExtensionNames = NULL;
+    info.enabledExtensionCount = availableEDECount;
+    info.ppEnabledExtensionNames = availableExtraDeviceExtensions;
     dev->gpu = gpu;
     err = vkCreateDevice(gpu->obj, &info, NULL, &dev->obj);
     if (err) ERR_EXIT(err);
@@ -591,7 +653,8 @@ static void AppCreateInstance(struct AppInstance *inst) {
     AppGetInstanceExtensions(inst);
 
 //---Build a list of extensions to load---
-#define MAX_EXTENSIONS 4
+#define EXTRA_INSTANCE_EXTENSION_COUNT 6
+#define MAX_EXTENSIONS (4+EXTRA_INSTANCE_EXTENSION_COUNT)
     uint32_t i = 0;
     uint32_t ext_count = 0;
     const char *ext_names[MAX_EXTENSIONS];  // array of string pointers to
@@ -636,6 +699,41 @@ static void AppCreateInstance(struct AppInstance *inst) {
     // then give up on reporting presentable surface formats."
     if (ext_count < 2) ext_count = 0;
     //----------------------------------------
+    inst->device_features2_enabled = false;
+    inst->display_surface_counter_enabled = false;
+    inst->external_semaphore_capabilities_enabled = false;
+    inst->external_memory_capabilities_enabled = false;
+    inst->khr_surface_enabled = false;
+    inst->surface_capabilities2_enabled = false;
+    const char *extraInstanceExtensions[EXTRA_INSTANCE_EXTENSION_COUNT] = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+                                                                         VK_KHX_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+                                                                         VK_KHX_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+                                                                         VK_EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME,
+                                                                         VK_KHR_SURFACE_EXTENSION_NAME,
+                                                                         VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME};
+    for (uint32_t k = 0; (k < EXTRA_INSTANCE_EXTENSION_COUNT); k++) {
+        for (uint32_t j = 0; (j < inst->global_extension_count); j++) {
+            if (!strcmp(extraInstanceExtensions[k], inst->global_extensions[j].extensionName)) {
+                ext_names[ext_count++] = extraInstanceExtensions[k];
+                if (!strcmp(extraInstanceExtensions[k], VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+                    inst->device_features2_enabled = true;
+                } else if (!strcmp(extraInstanceExtensions[k], VK_EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME)) {
+                    inst->display_surface_counter_enabled = true;
+                    inst->surface_capabilities2_ext.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES2_EXT;
+                    inst->surface_capabilities2_ext.pNext = NULL;
+                } else if (!strcmp(extraInstanceExtensions[k], VK_KHX_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME)) {
+                    inst->external_semaphore_capabilities_enabled = true;
+                } else if (!strcmp(extraInstanceExtensions[k], VK_KHX_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME)) {
+                    inst->external_memory_capabilities_enabled = true;
+                } else if (!strcmp(extraInstanceExtensions[k], VK_KHR_SURFACE_EXTENSION_NAME)) {
+                    inst->khr_surface_enabled = true;
+                } else if (!strcmp(extraInstanceExtensions[k], VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+                    inst->surface_capabilities2_enabled = true;
+                }
+                break;
+            }
+        }
+    }
 
     const VkApplicationInfo app_info = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -692,7 +790,60 @@ static void AppDestroyInstance(struct AppInstance *inst) {
     vkDestroyInstance(inst->instance, NULL);
 }
 
-static void AppGpuInit(struct AppGpu *gpu, uint32_t id, VkPhysicalDevice obj) {
+static void AppGpuInitExternalSemaphoreProps(struct AppGpu *gpu, struct AppInstance *inst) {
+    if (!gpu->external_semaphore_capabilities_enabled) {
+        return;
+    }
+    
+    PFN_vkGetPhysicalDeviceExternalSemaphorePropertiesKHX semaphore_func = (PFN_vkGetPhysicalDeviceExternalSemaphorePropertiesKHX)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceExternalSemaphorePropertiesKHX");
+
+    VkExternalSemaphoreHandleTypeFlagBitsKHX semaphore_handle_type_flag_bits[APPGPU_EXTERNAL_SEMAPHORE_PROPS_COUNT];
+    semaphore_handle_type_flag_bits[0] = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHX;
+    semaphore_handle_type_flag_bits[1] = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX;
+    semaphore_handle_type_flag_bits[2] = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX;
+    semaphore_handle_type_flag_bits[3] = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT_KHX;
+    semaphore_handle_type_flag_bits[4] = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FENCE_FD_BIT_KHX;
+
+    VkPhysicalDeviceExternalSemaphoreInfoKHX semaphore_info;
+    semaphore_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO_KHX;
+    semaphore_info.pNext = NULL;
+    for (uint32_t i = 0; i < APPGPU_EXTERNAL_SEMAPHORE_PROPS_COUNT; i++) {
+        semaphore_info.handleType = semaphore_handle_type_flag_bits[i];
+        gpu->semaphore_props[i].sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES_KHX;
+        gpu->semaphore_props[i].pNext = NULL;
+        semaphore_func(gpu->obj, &semaphore_info, &gpu->semaphore_props[i]);
+    }
+}
+
+static void AppGpuInitExternalBufferProps(struct AppGpu *gpu, struct AppInstance *inst) {
+    if (!gpu->external_memory_capabilities_enabled) {
+        return;
+    }
+
+    PFN_vkGetPhysicalDeviceExternalBufferPropertiesKHX buffer_func = (PFN_vkGetPhysicalDeviceExternalBufferPropertiesKHX)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceExternalBufferPropertiesKHX");
+
+    VkPhysicalDeviceExternalBufferInfoKHX buffer_info;
+    buffer_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO_KHX;
+    buffer_info.pNext = NULL;
+
+    uint32_t createFlagLimit = (uint32_t)VK_BUFFER_CREATE_SPARSE_ALIASED_BIT << 1; // 2017-12-06: VK_BUFFER_CREATE_SPARSE_ALIASED_BIT is last in the VkBufferCreateFlags enum list
+    uint32_t usageFlagLimit = (uint32_t)VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT << 1; // 2017-12-06: VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT is last in the VkBufferUsageFlags enum list
+
+    for (uint32_t c = 0; c < (createFlagLimit-1); c++) {
+        for (uint32_t u = 0; u < (usageFlagLimit-1); u++) {
+            VkExternalMemoryHandleTypeFlagBitsKHX h_t = 1;
+            for (uint32_t i = 0; i < EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT; i++) {
+                buffer_info.flags = c+1;
+                buffer_info.usage = u+1;
+                buffer_info.handleType = h_t;
+                buffer_func(gpu->obj, &buffer_info, &gpu->external_buffer_props[c + (u * BUFFER_USAGE_FLAG_COUNT) + (i * EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT)]);
+                h_t <<= 1;
+            }
+        }
+    }
+}
+
+static void AppGpuInit(struct AppGpu *gpu, struct AppInstance *inst, uint32_t id, VkPhysicalDevice obj) {
     uint32_t i;
 
     memset(gpu, 0, sizeof(*gpu));
@@ -700,35 +851,96 @@ static void AppGpuInit(struct AppGpu *gpu, uint32_t id, VkPhysicalDevice obj) {
     gpu->id = id;
     gpu->obj = obj;
 
-    vkGetPhysicalDeviceProperties(gpu->obj, &gpu->props);
+    gpu->device_features2_enabled = inst->device_features2_enabled;
+    gpu->external_semaphore_capabilities_enabled = inst->external_semaphore_capabilities_enabled;
+    gpu->external_memory_capabilities_enabled = inst->external_memory_capabilities_enabled;
+
+    if (gpu->device_features2_enabled) {
+        gpu->IDProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES_KHX;
+        gpu->props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
+        gpu->props2.pNext = &gpu->IDProps;
+        
+        PFN_vkGetPhysicalDeviceProperties2KHR func = (PFN_vkGetPhysicalDeviceProperties2KHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceProperties2KHR");
+        func(gpu->obj, &gpu->props2);
+
+        gpu->vkGetPhysicalDeviceFormatProperties2KHR = (PFN_vkGetPhysicalDeviceFormatProperties2KHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceFormatProperties2KHR");
+    } else {
+        vkGetPhysicalDeviceProperties(gpu->obj, &gpu->props);
+    }
 
     /* get queue count */
     vkGetPhysicalDeviceQueueFamilyProperties(gpu->obj, &gpu->queue_count, NULL);
 
-    gpu->queue_props = malloc(sizeof(gpu->queue_props[0]) * gpu->queue_count);
+    if (gpu->device_features2_enabled) {
+        gpu->queue_props2 = malloc(sizeof(gpu->queue_props2[0]) * gpu->queue_count);
 
-    if (!gpu->queue_props) ERR_EXIT(VK_ERROR_OUT_OF_HOST_MEMORY);
-    vkGetPhysicalDeviceQueueFamilyProperties(gpu->obj, &gpu->queue_count, gpu->queue_props);
+        if (!gpu->queue_props2) ERR_EXIT(VK_ERROR_OUT_OF_HOST_MEMORY);
+
+        PFN_vkGetPhysicalDeviceQueueFamilyProperties2KHR func = (PFN_vkGetPhysicalDeviceQueueFamilyProperties2KHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceQueueFamilyProperties2KHR");
+
+        for (i = 0; i < gpu->queue_count; i++) {
+            gpu->queue_props2[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2_KHR;
+            gpu->queue_props2[i].pNext = NULL;
+        }
+
+        func(gpu->obj, &gpu->queue_count, gpu->queue_props2);
+    } else {
+        gpu->queue_props = malloc(sizeof(gpu->queue_props[0]) * gpu->queue_count);
+
+        if (!gpu->queue_props) ERR_EXIT(VK_ERROR_OUT_OF_HOST_MEMORY);
+        vkGetPhysicalDeviceQueueFamilyProperties(gpu->obj, &gpu->queue_count, gpu->queue_props);
+    }
 
     /* set up queue requests */
     gpu->queue_reqs = malloc(sizeof(*gpu->queue_reqs) * gpu->queue_count);
     if (!gpu->queue_reqs) ERR_EXIT(VK_ERROR_OUT_OF_HOST_MEMORY);
     for (i = 0; i < gpu->queue_count; i++) {
-        float *queue_priorities = malloc(gpu->queue_props[i].queueCount * sizeof(float));
+        float *queue_priorities;
+        if (gpu->device_features2_enabled) {
+            queue_priorities = malloc(gpu->queue_props2[i].queueFamilyProperties.queueCount * sizeof(float));
+        } else {
+            queue_priorities = malloc(gpu->queue_props[i].queueCount * sizeof(float));
+        }
         if (!queue_priorities) ERR_EXIT(VK_ERROR_OUT_OF_HOST_MEMORY);
-        memset(queue_priorities, 0, gpu->queue_props[i].queueCount * sizeof(float));
+        if (gpu->device_features2_enabled) {
+            memset(queue_priorities, 0, gpu->queue_props2[i].queueFamilyProperties.queueCount * sizeof(float));
+        } else {
+            memset(queue_priorities, 0, gpu->queue_props[i].queueCount * sizeof(float));
+        }
         gpu->queue_reqs[i].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         gpu->queue_reqs[i].pNext = NULL;
         gpu->queue_reqs[i].flags = 0;
         gpu->queue_reqs[i].queueFamilyIndex = i;
-        gpu->queue_reqs[i].queueCount = gpu->queue_props[i].queueCount;
+        if (gpu->device_features2_enabled) {
+            gpu->queue_reqs[i].queueCount = gpu->queue_props2[i].queueFamilyProperties.queueCount;
+        } else {
+            gpu->queue_reqs[i].queueCount = gpu->queue_props[i].queueCount;
+        }
         gpu->queue_reqs[i].pQueuePriorities = queue_priorities;
     }
 
-    vkGetPhysicalDeviceMemoryProperties(gpu->obj, &gpu->memory_props);
 
-    vkGetPhysicalDeviceFeatures(gpu->obj, &gpu->features);
+    if (gpu->device_features2_enabled) {
+        gpu->multiViewFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES_KHX;
+        gpu->multiViewFeatures.pNext = NULL;
+        gpu->features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR;
+        gpu->features2.pNext = &gpu->multiViewFeatures;
 
+        PFN_vkGetPhysicalDeviceFeatures2KHR features_func = (PFN_vkGetPhysicalDeviceFeatures2KHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceFeatures2KHR");
+        features_func(gpu->obj, &gpu->features2);
+
+        gpu->memory_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2_KHR;
+        gpu->memory_props2.pNext = NULL;
+
+        PFN_vkGetPhysicalDeviceMemoryProperties2KHR memprop_func = (PFN_vkGetPhysicalDeviceMemoryProperties2KHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceMemoryProperties2KHR");
+        memprop_func(gpu->obj, &gpu->memory_props2);
+    } else {
+        vkGetPhysicalDeviceMemoryProperties(gpu->obj, &gpu->memory_props);
+        vkGetPhysicalDeviceFeatures(gpu->obj, &gpu->features);
+    }
+
+    AppGpuInitExternalSemaphoreProps(gpu, inst);
+    //AppGpuInitExternalBufferProps(gpu, inst);
     AppDevInit(&gpu->dev, gpu);
     AppDevInitFormats(&gpu->dev);
 }
@@ -741,7 +953,12 @@ static void AppGpuDestroy(struct AppGpu *gpu) {
         free((void *)gpu->queue_reqs[i].pQueuePriorities);
     }
     free(gpu->queue_reqs);
-    free(gpu->queue_props);
+
+    if (gpu->device_features2_enabled) {
+        free(gpu->queue_props2);
+    } else {
+        free(gpu->queue_props);
+    }
 }
 
 // clang-format off
@@ -982,11 +1199,179 @@ static int AppDumpSurfacePresentModes(struct AppInstance *inst, struct AppGpu *g
     fflush(stdout);
     return present_mode_count;
 }
+
+static void AppDumpSurfaceCapabilities(struct AppInstance *inst, struct AppGpu *gpu) {
+    // Dump the surface capabilities in VkSurfaceCapabilities2EXT
+
+    uint32_t minImageCount;
+    uint32_t maxImageCount;
+    VkExtent2D* currentExtent;
+    VkExtent2D* minImageExtent;
+    VkExtent2D* maxImageExtent;
+    uint32_t maxImageArrayLayers;
+    VkSurfaceTransformFlagsKHR supportedTransforms;
+    VkSurfaceTransformFlagBitsKHR currentTransform;
+    VkCompositeAlphaFlagsKHR supportedCompositeAlpha;
+    VkImageUsageFlags supportedUsageFlags;
+
+    char* title = "";
+    char* title_underline = "";
+
+    if (inst->surface_capabilities2_enabled) {
+        inst->shared_surface_capabilities.sType = VK_STRUCTURE_TYPE_SHARED_PRESENT_SURFACE_CAPABILITIES_KHR;
+        inst->shared_surface_capabilities.pNext = NULL;
+
+        inst->surface_capabilities2.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
+        inst->surface_capabilities2.pNext = &inst->shared_surface_capabilities;
+
+        VkPhysicalDeviceSurfaceInfo2KHR surface_info;
+        surface_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+        surface_info.pNext = NULL;
+        surface_info.surface = inst->surface;
+
+        PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR func = (PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+        func(gpu->obj, &surface_info, &inst->surface_capabilities2);
+
+        minImageCount = inst->surface_capabilities2.surfaceCapabilities.minImageCount;
+        maxImageCount = inst->surface_capabilities2.surfaceCapabilities.maxImageCount;
+        currentExtent = &inst->surface_capabilities2.surfaceCapabilities.currentExtent;
+        minImageExtent = &inst->surface_capabilities2.surfaceCapabilities.minImageExtent;
+        maxImageExtent = &inst->surface_capabilities2.surfaceCapabilities.maxImageExtent;
+        maxImageArrayLayers = inst->surface_capabilities2.surfaceCapabilities.maxImageArrayLayers;
+        supportedTransforms = inst->surface_capabilities2.surfaceCapabilities.supportedTransforms;
+        currentTransform = inst->surface_capabilities2.surfaceCapabilities.currentTransform;
+        supportedCompositeAlpha = inst->surface_capabilities2.surfaceCapabilities.supportedCompositeAlpha;
+        supportedUsageFlags = inst->surface_capabilities2.surfaceCapabilities.supportedUsageFlags;
+
+        title           = "VkSurfaceCapabilities2KHR:";
+        title_underline = "==========================";
+    } else if (inst->khr_surface_enabled) {
+        PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR func = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+        func(gpu->obj, inst->surface, &inst->surface_capabilities);
+
+        minImageCount = inst->surface_capabilities.minImageCount;
+        maxImageCount = inst->surface_capabilities.maxImageCount;
+        currentExtent = &inst->surface_capabilities.currentExtent;
+        minImageExtent = &inst->surface_capabilities.minImageExtent;
+        maxImageExtent = &inst->surface_capabilities.maxImageExtent;
+        maxImageArrayLayers = inst->surface_capabilities.maxImageArrayLayers;
+        supportedTransforms = inst->surface_capabilities.supportedTransforms;
+        currentTransform = inst->surface_capabilities.currentTransform;
+        supportedCompositeAlpha = inst->surface_capabilities.supportedCompositeAlpha;
+        supportedUsageFlags = inst->surface_capabilities.supportedUsageFlags;
+
+        title           = "VkSurfaceCapabilitiesKHR:";
+        title_underline = "=========================";
+    }
+
+    if (inst->display_surface_counter_enabled) {
+        PFN_vkGetPhysicalDeviceSurfaceCapabilities2EXT func = (PFN_vkGetPhysicalDeviceSurfaceCapabilities2EXT)vkGetInstanceProcAddr(inst->instance, "vkGetPhysicalDeviceSurfaceCapabilities2EXT");
+        func(gpu->obj, inst->surface, &inst->surface_capabilities2_ext);
+
+        minImageCount = inst->surface_capabilities2_ext.minImageCount;
+        maxImageCount = inst->surface_capabilities2_ext.maxImageCount;
+        currentExtent = &inst->surface_capabilities2_ext.currentExtent;
+        minImageExtent = &inst->surface_capabilities2_ext.minImageExtent;
+        maxImageExtent = &inst->surface_capabilities2_ext.maxImageExtent;
+        maxImageArrayLayers = inst->surface_capabilities2_ext.maxImageArrayLayers;
+        supportedTransforms = inst->surface_capabilities2_ext.supportedTransforms;
+        currentTransform = inst->surface_capabilities2_ext.currentTransform;
+        supportedCompositeAlpha = inst->surface_capabilities2_ext.supportedCompositeAlpha;
+        supportedUsageFlags = inst->surface_capabilities2_ext.supportedUsageFlags;
+        title           = "VkSurfaceCapabilities2EXT:";
+        title_underline = "==========================";
+    }
+
+    printf("\n%s\n", title);
+    printf("%s\n\n", title_underline);
+    printf("\tminImageCount       = %u\n", minImageCount);
+    printf("\tmaxImageCount       = %u\n", maxImageCount);
+    printf("\tcurrentExtent:\n");
+    printf("\t\twidth       = %u\n", currentExtent->width);
+    printf("\t\theight      = %u\n", currentExtent->height);
+    printf("\tminImageExtent:\n");
+    printf("\t\twidth       = %u\n", minImageExtent->width);
+    printf("\t\theight      = %u\n", minImageExtent->height);
+    printf("\tmaxImageExtent:\n");
+    printf("\t\twidth       = %u\n", maxImageExtent->width);
+    printf("\t\theight      = %u\n", maxImageExtent->height);
+    printf("\tmaxImageArrayLayers = %u\n", maxImageArrayLayers);
+    printf("\tsupportedTransform:\n");
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR\n"); }
+    if (supportedTransforms & VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_INHERIT_BIT_KHR\n"); }
+    printf("\tcurrentTransform:\n");
+    if (currentTransform & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR\n"); }
+    else if (currentTransform & VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR) { printf("\t\tVK_SURFACE_TRANSFORM_INHERIT_BIT_KHR\n"); }
+    printf("\tsupportedCompositeAlpha:\n");
+    if (supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) { printf("\t\tVK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR\n"); }
+    if (supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) { printf("\t\tVK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR\n"); }
+    if (supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) { printf("\t\tVK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR\n"); }
+    if (supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) { printf("\t\tVK_COMPOSITE_ALPHA_INHERIT_BIT_KHR\n"); }
+    printf("\tsupportedUsageFlags:\n");
+    if (supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) { printf("\t\tVK_IMAGE_USAGE_TRANSFER_SRC_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) { printf("\t\tVK_IMAGE_USAGE_TRANSFER_DST_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) { printf("\t\tVK_IMAGE_USAGE_SAMPLED_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) { printf("\t\tVK_IMAGE_USAGE_STORAGE_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT\n"); }
+    if (supportedUsageFlags & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT\n"); }
+    
+    if (inst->display_surface_counter_enabled) {
+        printf("\tsupportedSurfaceCounters:\n");
+        if (inst->surface_capabilities2_ext.supportedSurfaceCounters & VK_SURFACE_COUNTER_VBLANK_EXT) { printf("\t\tVK_SURFACE_COUNTER_VBLANK_EXT\n"); }
+    }
+
+    if (inst->surface_capabilities2_enabled) {
+        void *place = inst->surface_capabilities2.pNext;
+        while (place) {
+            struct VkStructureHeader* work = (struct VkStructureHeader*) place;
+            if (work->sType == VK_STRUCTURE_TYPE_SHARED_PRESENT_SURFACE_CAPABILITIES_KHR) {
+                printf("\nVkSharedPresentSurfaceCapabilitiesKHR:\n");
+                printf("========================================\n");
+                VkSharedPresentSurfaceCapabilitiesKHR* shared_surface_capabilities = (VkSharedPresentSurfaceCapabilitiesKHR*)place;
+                printf("\tsharedPresentSupportedUsageFlags:\n");
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) { printf("\t\tVK_IMAGE_USAGE_TRANSFER_SRC_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) { printf("\t\tVK_IMAGE_USAGE_TRANSFER_DST_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) { printf("\t\tVK_IMAGE_USAGE_SAMPLED_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) { printf("\t\tVK_IMAGE_USAGE_STORAGE_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT\n"); }
+                if (shared_surface_capabilities->sharedPresentSupportedUsageFlags & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) { printf("\t\tVK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT\n"); }
+            }
+
+            place = work->pNext;
+        }
+    }
+}
+
 #endif
 
 static void AppDevDumpFormatProps(const struct AppDev *dev, VkFormat fmt)
 {
-    const VkFormatProperties *props = &dev->format_props[fmt];
+    const VkFormatProperties *props;
+
+    if (dev->gpu->device_features2_enabled) {
+        props = &dev->format_props2[fmt].formatProperties;
+    } else {
+        props = &dev->format_props[fmt];
+    }
+
     struct {
         const char *name;
         VkFlags flags;
@@ -1005,7 +1390,7 @@ static void AppDevDumpFormatProps(const struct AppDev *dev, VkFormat fmt)
         if (features[i].flags == 0) {
             printf("\n\t\tNone");
         } else {
-            printf("%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+            printf("%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
                ((features[i].flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)                  ? "\n\t\tVK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT"                  : ""),  //0x0001
                ((features[i].flags & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)                  ? "\n\t\tVK_FORMAT_FEATURE_STORAGE_IMAGE_BIT"                  : ""),  //0x0002
                ((features[i].flags & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)           ? "\n\t\tVK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT"           : ""),  //0x0004
@@ -1019,10 +1404,35 @@ static void AppDevDumpFormatProps(const struct AppDev *dev, VkFormat fmt)
                ((features[i].flags & VK_FORMAT_FEATURE_BLIT_SRC_BIT)                       ? "\n\t\tVK_FORMAT_FEATURE_BLIT_SRC_BIT"                       : ""),  //0x0400
                ((features[i].flags & VK_FORMAT_FEATURE_BLIT_DST_BIT)                       ? "\n\t\tVK_FORMAT_FEATURE_BLIT_DST_BIT"                       : ""),  //0x0800
                ((features[i].flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)    ? "\n\t\tVK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT"    : ""),  //0x1000
-               ((features[i].flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_IMG) ? "\n\t\tVK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_IMG" : "")); //0x2000
+               ((features[i].flags & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_IMG) ? "\n\t\tVK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_IMG" : ""),  //0x2000
+               ((features[i].flags & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT_KHR)               ? "\n\t\tVK_FORMAT_FEATURE_TRANSFER_SRC_BIT_KHR"               : ""),  //0x4000
+               ((features[i].flags & VK_FORMAT_FEATURE_TRANSFER_DST_BIT_KHR)               ? "\n\t\tVK_FORMAT_FEATURE_TRANSFER_DST_BIT_KHR"               : "")); //0x8000
         }
     }
     printf("\n");
+}
+
+static void printExternalMemoryProps(const VkExternalMemoryPropertiesKHX *external_mem_props, char* indent) {
+    printf("%sexternalMemoryFeatures:\n", indent);
+    if (external_mem_props->externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT_KHX\n", indent); }
+    if (external_mem_props->externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT_KHX\n", indent); }
+    if (external_mem_props->externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT_KHX\n", indent); }
+    printf("%sexportFromImportedHandleTypes:\n", indent);
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHX\n", indent); }
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX\n", indent); }
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX\n", indent); }
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT_KHX\n", indent); }
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT_KHX\n", indent); }
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT_KHX\n", indent); }
+    if (external_mem_props->exportFromImportedHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT_KHX\n", indent); }
+    printf("%scompatibleHandleTypes:\n", indent);
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHX\n", indent); }
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX\n", indent); }
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX\n", indent); }
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT_KHX\n", indent); }
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT_KHX\n", indent); }
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT_KHX\n", indent); }
+    if (external_mem_props->compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT_KHX) { printf("%s\tVK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT_KHX\n", indent); }
 }
 
 
@@ -1046,7 +1456,13 @@ AppDevDump(const struct AppDev *dev)
 
 static void AppGpuDumpFeatures(const struct AppGpu *gpu)
 {
-    const VkPhysicalDeviceFeatures *features = &gpu->features;
+    const VkPhysicalDeviceFeatures *features;
+
+    if (gpu->device_features2_enabled) {
+        features = &gpu->features2.features;
+    } else {
+        features = &gpu->features;
+    }
 
     printf("VkPhysicalDeviceFeatures:\n");
     printf("=========================\n");
@@ -1106,6 +1522,82 @@ static void AppGpuDumpFeatures(const struct AppGpu *gpu)
     printf("\tsparseResidencyAliased                  = %u\n", features->sparseResidencyAliased                 );
     printf("\tvariableMultisampleRate                 = %u\n", features->variableMultisampleRate                );
     printf("\tinheritedQueries                        = %u\n", features->inheritedQueries                       );
+
+    if (gpu->device_features2_enabled) {
+        void *place = gpu->features2.pNext;
+        while (place) {
+            struct VkStructureHeader* work = (struct VkStructureHeader*) place;
+            if (work->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES_KHX) {
+                printf("\nVkPhysicalDeviceMultiviewFeaturesKHX:\n");
+                printf("=====================================\n");
+                VkPhysicalDeviceMultiviewFeaturesKHX* multiviewFeatures = (VkPhysicalDeviceMultiviewFeaturesKHX*) place;
+                printf("\tmultiview                   = %u\n", multiviewFeatures->multiview                  );
+                printf("\tmultiviewGeometryShader     = %u\n", multiviewFeatures->multiviewGeometryShader    );
+                printf("\tmultiviewTessellationShader = %u\n", multiviewFeatures->multiviewTessellationShader);
+            }
+
+            place = work->pNext;
+        }
+    }
+}
+
+static void AppGpuDumpExternalBufferProps(const struct AppGpu *gpu) {
+    if (!gpu->external_memory_capabilities_enabled) {
+        return;
+    }
+
+    printf("VkExternalBufferPropertiesKHX:\n");
+    printf("==============================\n\n");
+
+    uint32_t createFlagLimit = (uint32_t)VK_BUFFER_CREATE_SPARSE_ALIASED_BIT << 1; // 2017-12-06: VK_BUFFER_CREATE_SPARSE_ALIASED_BIT is last in the VkBufferCreateFlags enum list
+    uint32_t usageFlagLimit = (uint32_t)VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT << 1; // 2017-12-06: VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT is last in the VkBufferUsageFlags enum list
+
+    for (uint32_t c = 0; c < (createFlagLimit-1); c++) {
+        for (uint32_t u = 0; u < (usageFlagLimit-1); u++) {
+            VkExternalMemoryHandleTypeFlagBitsKHX h_t = 1;
+            for (uint32_t i = 0; i < EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT; i++) {
+                VkExternalMemoryPropertiesKHX buffer_props = gpu->external_buffer_props[c + (u * BUFFER_USAGE_FLAG_COUNT) + (h_t * EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BIT_COUNT)].externalMemoryProperties;
+
+                if (!buffer_props.externalMemoryFeatures && !buffer_props.exportFromImportedHandleTypes && !buffer_props.compatibleHandleTypes) {
+                    h_t <<= 1;
+                    continue;
+                }
+
+                uint32_t cf = c + 1;
+                uint32_t uf = u + 1;
+
+                printf("\tCreate Flags: ");
+                if (cf & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) { printf("SPARSE_BINDING | "); }
+                if (cf & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) { printf("SPARSE_RESIDENCY | "); }
+                if (cf & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT) { printf("SPARSE_ALIASED"); }
+                printf("\n");
+                printf("\tUsage Flags: ");
+                if (uf & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) { printf("TRANSFER_SRC | "); }
+                if (uf & VK_BUFFER_USAGE_TRANSFER_DST_BIT) { printf("TRANSFER_DST | "); }
+                if (uf & VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT) { printf("UNIFORM_TEXEL_BUFFER | "); }
+                if (uf & VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT) { printf("STORAGE_TEXEL_BUFFER | "); }
+                if (uf & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) { printf("UNIFORM_BUFFER_BIT | "); }
+                if (uf & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) { printf("STORAGE_BUFFER_BIT | "); }
+                if (uf & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) { printf("INDEX_BUFFER_BIT | "); }
+                if (uf & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) { printf("VERTEX_BUFFER_BIT | "); }
+                if (uf & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) { printf("INDIRECT_BUFFER_BIT"); }
+                printf("\n");
+                printf("\tHandle Type: ");
+                if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHX) { printf("OPAQUE_FD"); }
+                else if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX) { printf("OPAQUE_WIN32"); }
+                else if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX) { printf("OPAQUE_WIN32_KMT"); }
+                else if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT_KHX) { printf("D3D11_TEXTURE"); }
+                else if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT_KHX) { printf("D3D11_TEXTURE_KMT"); }
+                else if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT_KHX) { printf("D3D12_HEAP"); }
+                else if (h_t & VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT_KHX) { printf("D3D12_RESOURCE"); }
+                printf("\n");
+                printf("\t---------------\n");
+                printExternalMemoryProps(&buffer_props, "\t\t");
+                printf("\n");
+                h_t <<= 1;
+            }
+        }
+    }
 }
 
 static void AppDumpSparseProps(const VkPhysicalDeviceSparseProperties *sparse_props)
@@ -1243,7 +1735,14 @@ static void AppDumpLimits(const VkPhysicalDeviceLimits *limits)
 
 static void AppGpuDumpProps(const struct AppGpu *gpu)
 {
-    const VkPhysicalDeviceProperties *props = &gpu->props;
+    const VkPhysicalDeviceProperties *props;
+
+    if (gpu->device_features2_enabled) {
+        props = &gpu->props2.properties;
+    } else {
+        props = &gpu->props;
+    }
+
     const uint32_t apiVersion=props->apiVersion;
     const uint32_t major = VK_VERSION_MAJOR(apiVersion);
     const uint32_t minor = VK_VERSION_MINOR(apiVersion);
@@ -1258,8 +1757,43 @@ static void AppGpuDumpProps(const struct AppGpu *gpu)
     printf("\tdeviceType     = %s\n",                     VkPhysicalDeviceTypeString(props->deviceType));
     printf("\tdeviceName     = %s\n",                     props->deviceName);
 
-    AppDumpLimits(&gpu->props.limits);
-    AppDumpSparseProps(&gpu->props.sparseProperties);
+    if (gpu->device_features2_enabled) {
+        void *place = gpu->props2.pNext;
+        while (place) {
+            struct VkStructureHeader* work = (struct VkStructureHeader*) place;
+            if (work->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES_KHX && (gpu->external_semaphore_capabilities_enabled || gpu->external_memory_capabilities_enabled)) {
+                printf("\tVkPhysicalDeviceIDPropertiesKHX:\n");
+                printf("\t----------------------------------\n");
+                VkPhysicalDeviceIDPropertiesKHX* IDProps = (VkPhysicalDeviceIDPropertiesKHX*)place;
+                printf("\t\tdeviceUUID    = ");
+                for (uint32_t i = 0; (i < (VK_UUID_SIZE-1)); i++) {
+                    printf("%u:", IDProps->deviceUUID[i]);
+                }
+                printf("%u\n", IDProps->deviceUUID[VK_UUID_SIZE - 1]);
+                printf("\t\tdriverUUID    = ");
+                for (uint32_t i = 0; (i < (VK_UUID_SIZE-1)); i++) {
+                    printf("%u:", IDProps->driverUUID[i]);
+                }
+                printf("%u\n", IDProps->deviceUUID[VK_UUID_SIZE - 1]);
+                printf("\t\tdeviceLUID    = ");
+                for (uint32_t i = 0; (i < (VK_LUID_SIZE_KHX-1)); i++) {
+                    printf("%u:", IDProps->deviceLUID[i]);
+                }
+                printf("%u\n", IDProps->deviceLUID[VK_LUID_SIZE_KHX - 1]);
+                printf("\t\tdeviceLUIDValid = %u\n", IDProps->deviceLUIDValid);
+            }
+
+            place = work->pNext;
+        }
+    }
+
+    if (gpu->device_features2_enabled) {
+        AppDumpLimits(&gpu->props2.properties.limits);
+        AppDumpSparseProps(&gpu->props2.properties.sparseProperties);
+    } else {
+        AppDumpLimits(&gpu->props.limits);
+        AppDumpSparseProps(&gpu->props.sparseProperties);
+    }
 
     fflush(stdout);
 }
@@ -1295,7 +1829,13 @@ static bool HasExtension(const char *extension_name, const uint32_t extension_co
 #endif
 
 static void AppGpuDumpQueueProps(const struct AppGpu *gpu, uint32_t id) {
-    const VkQueueFamilyProperties *props = &gpu->queue_props[id];
+    const VkQueueFamilyProperties *props;
+
+    if (gpu->device_features2_enabled) {
+        props = &gpu->queue_props2[id].queueFamilyProperties;
+    } else {
+        props = &gpu->queue_props[id];
+    }
 
     printf("VkQueueFamilyProperties[%d]:\n", id);
     printf("===========================\n");
@@ -1349,7 +1889,13 @@ static char *HumanReadable(const size_t sz) {
 }
 
 static void AppGpuDumpMemoryProps(const struct AppGpu *gpu) {
-    const VkPhysicalDeviceMemoryProperties *props = &gpu->memory_props;
+    const VkPhysicalDeviceMemoryProperties *props;
+
+    if (gpu->device_features2_enabled) {
+        props = &gpu->memory_props2.memoryProperties;
+    } else {
+        props = &gpu->memory_props;
+    }
 
     printf("VkPhysicalDeviceMemoryProperties:\n");
     printf("=================================\n");
@@ -1387,6 +1933,44 @@ static void AppGpuDumpMemoryProps(const struct AppGpu *gpu) {
     fflush(stdout);
 }
 
+static void AppGpuDumpSemaphoreProps(const struct AppGpu *gpu) {
+    if (!gpu->external_semaphore_capabilities_enabled) {
+        return;
+    }
+
+    printf("VkExternalSemaphorePropertiesKHX:\n");
+    printf("=================================\n");
+    printf("\n");
+
+    char* semaphore_handle_type_names[APPGPU_EXTERNAL_SEMAPHORE_PROPS_COUNT];
+    semaphore_handle_type_names[0] = "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHX";
+    semaphore_handle_type_names[1] = "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX";
+    semaphore_handle_type_names[2] = "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX";
+    semaphore_handle_type_names[3] = "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT_KHX";
+    semaphore_handle_type_names[4] = "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FENCE_FD_BIT_KHX";
+
+    for (uint32_t i = 0; i < APPGPU_EXTERNAL_SEMAPHORE_PROPS_COUNT; i++) {
+        printf("\t%s:\n", semaphore_handle_type_names[i]);
+        printf("\t\texportFromImportedHandleTypes:\n");
+        if (gpu->semaphore_props[i].exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FENCE_FD_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FENCE_FD_BIT_KHX\n"); }
+        printf("\t\tcompatibleHandleTypes:\n");
+        if (gpu->semaphore_props[i].compatibleHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].compatibleHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].compatibleHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].compatibleHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].compatibleHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FENCE_FD_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FENCE_FD_BIT_KHX\n"); }
+        printf("\t\texternalSemaphoreFeatures:\n");
+        if (gpu->semaphore_props[i].externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT_KHX\n"); }
+        if (gpu->semaphore_props[i].externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT_KHX) { printf("\t\t\tVK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT_KHX\n"); }
+
+        printf("\n");
+    }
+}
+
 static void AppGpuDump(const struct AppGpu *gpu) {
     uint32_t i;
 
@@ -1402,6 +1986,10 @@ static void AppGpuDump(const struct AppGpu *gpu) {
         printf("\n");
     }
     AppGpuDumpMemoryProps(gpu);
+    printf("\n");
+    AppGpuDumpSemaphoreProps(gpu);
+    printf("\n");
+    //AppGpuDumpExternalBufferProps(gpu);
     printf("\n");
     AppGpuDumpFeatures(gpu);
     printf("\n");
@@ -1470,7 +2058,7 @@ int main(int argc, char **argv) {
     gpus = malloc(sizeof(gpus[0]) * gpu_count);
     if (!gpus) ERR_EXIT(VK_ERROR_OUT_OF_HOST_MEMORY);
     for (uint32_t i = 0; i < gpu_count; i++) {
-        AppGpuInit(&gpus[i], i, objs[i]);
+        AppGpuInit(&gpus[i], &inst, i, objs[i]);
         printf("\n\n");
     }
 
@@ -1529,6 +2117,7 @@ int main(int argc, char **argv) {
             printf("Surface type : %s\n", VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
             format_count += AppDumpSurfaceFormats(&inst, &gpus[i]);
             present_mode_count += AppDumpSurfacePresentModes(&inst, &gpus[i]);
+            AppDumpSurfaceCapabilities(&inst, &gpus[i]);
             AppDestroySurface(&inst);
         }
         AppDestroyWin32Window(&inst);
@@ -1543,6 +2132,7 @@ int main(int argc, char **argv) {
             printf("Surface type : %s\n", VK_KHR_XCB_SURFACE_EXTENSION_NAME);
             format_count += AppDumpSurfaceFormats(&inst, &gpus[i]);
             present_mode_count += AppDumpSurfacePresentModes(&inst, &gpus[i]);
+            AppDumpSurfaceCapabilities(&inst, &gpus[i]);
             AppDestroySurface(&inst);
         }
         AppDestroyXcbWindow(&inst);
@@ -1557,6 +2147,7 @@ int main(int argc, char **argv) {
             printf("Surface type : %s\n", VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
             format_count += AppDumpSurfaceFormats(&inst, &gpus[i]);
             present_mode_count += AppDumpSurfacePresentModes(&inst, &gpus[i]);
+            AppDumpSurfaceCapabilities(&inst, &gpus[i]);
             AppDestroySurface(&inst);
         }
         AppDestroyXlibWindow(&inst);
